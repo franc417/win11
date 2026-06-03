@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# ══════════════════════════════════════════════════════════════════
+#  win11 — Windows 11 ISO Downloader
+#  • Paste your own Microsoft direct link (any version/language)
+#  • aria2c 16-connection download — maximum speed
+#  • Background tmux daemon — survives terminal close
+#  • Resume support — continues from where it stopped
+#  • SHA256 verification against Microsoft official hash
+# ══════════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+# ── Config ────────────────────────────────────────────────────────
+ISO_DIR="/home/mkz/iso"
+ISO_FILE="${ISO_DIR}/Win11_24H2_English_x64.iso"
+ARIA2_SESSION="${ISO_DIR}/.win11_aria2.session"
+LOG_FILE="${ISO_DIR}/.win11_download.log"
+STATUS_FILE="${ISO_DIR}/.win11_status"
+URL_FILE="${ISO_DIR}/.win11_url"
+SESSION_NAME="win11-download"
+SELF="$(realpath "$0")"
+
+# Official Microsoft SHA256 — Windows 11 24H2 English x64
+OFFICIAL_SHA256="B56B911BF18A2CEAEB3904D87E7C770BDF92D3099599D61AC2497B91BF190B11"
+
+# aria2c options — 16 parallel connections, resume enabled
+ARIA2_OPTS=(
+    --continue=true
+    --max-connection-per-server=16
+    --split=16
+    --min-split-size=5M
+    --file-allocation=falloc
+    --save-session="${ARIA2_SESSION}"
+    --save-session-interval=10
+    --console-log-level=warn
+    --summary-interval=1
+    --max-tries=0
+    --retry-wait=5
+    --connect-timeout=30
+    --timeout=120
+    --http-accept-gzip=true
+    --auto-file-renaming=false
+    --out="Win11_24H2_English_x64.iso"
+    --dir="${ISO_DIR}"
+)
+
+# ── Colors ────────────────────────────────────────────────────────
+R=$'\033[0;31m'
+G=$'\033[0;32m'
+Y=$'\033[0;33m'
+C=$'\033[0;36m'
+W=$'\033[1;37m'
+D=$'\033[2;37m'
+BL=$'\033[1;34m'
+N=$'\033[0m'
+BOLD=$'\033[1m'
+
+clear_screen() { printf '\033[2J\033[H'; }
+
+print_banner() {
+    printf "${BL}"
+    cat << 'EOF'
+╔══════════════════════════════════════════════════════════════════╗
+║                                                                  ║
+║   ██╗    ██╗██╗███╗   ██╗ ██╗ ██╗                               ║
+║   ██║    ██║██║████╗  ██║███║███║                               ║
+║   ██║ █╗ ██║██║██╔██╗ ██║╚██║╚██║                               ║
+║   ██║███╗██║██║██║╚██╗██║  ██║ ██║                               ║
+║   ╚███╔███╔╝██║██║ ╚████║  ██║ ██║                               ║
+║    ╚══╝╚══╝ ╚═╝╚═╝  ╚═══╝  ╚═╝ ╚═╝                               ║
+║                                                                  ║
+║          ISO Downloader  ·  24H2  ·  English x64                ║
+╚══════════════════════════════════════════════════════════════════╝
+EOF
+    printf "${N}\n"
+}
+
+check_deps() {
+    local missing=()
+    for cmd in aria2c sha256sum tmux; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf "\n${R}  ✗ Missing:${N} ${missing[*]}\n"
+        printf "${Y}  Fix:${N} sudo pacman -S aria2 tmux coreutils\n\n"
+        exit 1
+    fi
+}
+
+human_bytes() {
+    local b="$1"
+    if   (( b >= 1073741824 )); then awk "BEGIN{printf \"%.2f GiB\", $b/1073741824}"
+    elif (( b >= 1048576    )); then awk "BEGIN{printf \"%.1f MiB\", $b/1048576}"
+    elif (( b >= 1024       )); then awk "BEGIN{printf \"%.1f KiB\", $b/1024}"
+    else printf "%d B" "$b"
+    fi
+}
+
+draw_bar() {
+    local pct=$1 width=${2:-54}
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    printf "${G}"
+    local i; for (( i=0; i<filled; i++ )); do printf "█"; done
+    printf "${D}"
+    for (( i=0; i<empty; i++ )); do printf "░"; done
+    printf "${N}"
+}
+
+write_status() { echo "$1" > "$STATUS_FILE"; }
+read_status()  { cat "$STATUS_FILE" 2>/dev/null || echo "IDLE"; }
+save_url()     { echo "$1" > "$URL_FILE"; }
+load_url()     { cat "$URL_FILE" 2>/dev/null || echo ""; }
+
+# ── Prompt user for download URL ──────────────────────────────────
+prompt_for_url() {
+    clear_screen
+    print_banner
+
+    printf "${W}  How to get your download link:${N}\n\n"
+    printf "  ${D}1.${N} Open: ${C}https://www.microsoft.com/en-us/software-download/windows11${N}\n"
+    printf "  ${D}2.${N} Select ${W}Windows 11 (multi-edition ISO for x64)${N} → Confirm\n"
+    printf "  ${D}3.${N} Choose language ${W}English${N} → Confirm\n"
+    printf "  ${D}4.${N} Right-click ${W}64-bit Download${N} → Copy link address\n"
+    printf "  ${D}5.${N} Paste it below\n\n"
+    printf "${W}  ┌─────────────────────────────────────────────────────────────┐${N}\n"
+    printf "  │\n"
+    printf "  │  ${Y}Paste URL:${N} "
+
+    local url=""
+    read -r url
+
+    printf "  │\n"
+    printf "${W}  └─────────────────────────────────────────────────────────────┘${N}\n\n"
+
+    # Basic validation
+    url="${url// /}"  # strip accidental spaces
+    if [[ -z "$url" ]]; then
+        printf "  ${R}✗ No URL entered. Exiting.${N}\n\n"
+        exit 1
+    fi
+    if [[ "$url" != http* ]]; then
+        printf "  ${R}✗ That doesn't look like a valid URL.${N}\n\n"
+        exit 1
+    fi
+    if [[ "$url" != *.iso* ]] && [[ "$url" != *microsoft* ]] && [[ "$url" != *download* ]]; then
+        printf "  ${Y}⚠ URL doesn't look like a Windows ISO link. Continue anyway? [y/N] ${N}"
+        read -r confirm
+        [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
+    fi
+
+    save_url "$url"
+    echo "$url"
+}
+
+# ── Download worker (runs inside tmux) ───────────────────────────
+do_download() {
+    local url
+    url=$(load_url)
+
+    if [[ -z "$url" ]]; then
+        printf "${R}  ✗ No URL found. Run win11 again and paste the link.${N}\n"
+        write_status "IDLE"
+        exit 1
+    fi
+
+    write_status "DOWNLOADING"
+    mkdir -p "$ISO_DIR"
+
+    printf "\n${C}  aria2c starting — 16 connections, resume enabled${N}\n"
+    printf "${D}  Saving to: %s${N}\n\n" "$ISO_FILE"
+
+    local -a extra=()
+    [[ -f "$ARIA2_SESSION" ]] && extra+=(--input-file="$ARIA2_SESSION")
+
+    aria2c "${ARIA2_OPTS[@]}" "${extra[@]}" "$url" || true
+
+    # Post-download verification
+    if [[ -f "$ISO_FILE" ]]; then
+        local sz
+        sz=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+        if (( sz > 4000000000 )); then
+            write_status "VERIFYING"
+            printf "\n${Y}  ══ Verifying SHA256 (~30s)... ══${N}\n"
+            local computed
+            computed=$(sha256sum "$ISO_FILE" | awk '{print toupper($1)}')
+            if [[ "$computed" == "$OFFICIAL_SHA256" ]]; then
+                write_status "VERIFIED_OK"
+                printf "${G}  ✔ SHA256 MATCH — ISO is authentic and uncorrupted${N}\n"
+            else
+                write_status "HASH_FAIL"
+                printf "${R}  ✗ SHA256 MISMATCH${N}\n"
+                printf "${R}  Expected : %s${N}\n" "$OFFICIAL_SHA256"
+                printf "${R}  Got      : %s${N}\n" "$computed"
+                printf "${Y}  This may happen if the URL was for a different language/version.${N}\n"
+            fi
+        else
+            write_status "INTERRUPTED"
+            printf "${Y}  Download incomplete — run win11 to resume${N}\n"
+        fi
+    else
+        write_status "INTERRUPTED"
+    fi
+}
+
+# ── Progress display ──────────────────────────────────────────────
+show_progress() {
+    local status
+    status=$(read_status)
+    local saved_url
+    saved_url=$(load_url)
+
+    clear_screen
+    print_banner
+
+    printf "${W}  ┌─ Download Status ───────────────────────────────────────────┐${N}\n"
+
+    case "$status" in
+        IDLE)
+            printf "  │  ${D}Status:${N}  ${Y}Idle — run ${W}win11${Y} to start${N}\n"
+            ;;
+        DOWNLOADING)
+            local partial=0 pct=0
+            local TARGET=5802987520
+
+            if [[ -f "${ISO_FILE}.aria2" && -f "$ISO_FILE" ]]; then
+                partial=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+            elif [[ -f "$ISO_FILE" ]]; then
+                partial=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+            fi
+
+            (( TARGET > 0 && partial > 0 )) && pct=$(( partial * 100 / TARGET )) || true
+            (( pct > 100 )) && pct=100 || true
+
+            printf "  │  ${D}Status:${N}   ${C}● Downloading...${N}\n"
+            printf "  │  ${D}Progress:${N} ${W}%3d%%${N}  %s / %s\n" \
+                "$pct" "$(human_bytes "$partial")" "$(human_bytes "$TARGET")"
+            printf "  │\n"
+            printf "  │  "
+            draw_bar "$pct" 54
+            printf "\n"
+            printf "  │\n"
+            printf "  │  ${D}Live view:${N}  ${W}win11 attach${N}\n"
+            printf "  │  ${D}Log file:${N}   ${D}%s${N}\n" "$LOG_FILE"
+            ;;
+        VERIFYING)
+            printf "  │  ${D}Status:${N}  ${Y}⟳ Running SHA256 check...${N}\n"
+            ;;
+        VERIFIED_OK)
+            local sz; sz=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+            printf "  │  ${D}Status:${N}  ${G}${BOLD}✔ Complete & Verified${N}\n"
+            printf "  │  ${D}File:${N}    ${W}%s${N}\n" "$ISO_FILE"
+            printf "  │  ${D}Size:${N}    %s\n" "$(human_bytes "$sz")"
+            printf "  │  ${D}SHA256:${N}  ${G}✔ Matches official Microsoft hash${N}\n"
+            printf "  │\n"
+            printf "  │  ${G}  Ready to burn or mount!${N}\n"
+            ;;
+        HASH_FAIL)
+            printf "  │  ${D}Status:${N}  ${R}✗ Hash mismatch${N}\n"
+            printf "  │  ${D}Fix:${N}     run ${W}win11 clean${N} then ${W}win11${N} with a fresh link\n"
+            ;;
+        INTERRUPTED)
+            printf "  │  ${D}Status:${N}  ${Y}⚠ Interrupted${N}\n"
+            if [[ -n "$saved_url" ]]; then
+                printf "  │  ${D}Resume:${N}  run ${W}win11${N} — saved URL will be reused\n"
+            else
+                printf "  │  ${D}Resume:${N}  run ${W}win11${N} and paste a fresh link\n"
+            fi
+            ;;
+    esac
+
+    printf "${W}  └─────────────────────────────────────────────────────────────┘${N}\n\n"
+}
+
+# ── Subcommands ───────────────────────────────────────────────────
+cmd_attach() {
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        printf "${C}  Attaching... (detach: Ctrl+B then D)${N}\n\n"
+        sleep 0.5
+        tmux attach -t "$SESSION_NAME"
+    else
+        printf "${Y}  No active session. Run ${W}win11${Y} to start.${N}\n\n"
+    fi
+}
+
+cmd_verify() {
+    [[ ! -f "$ISO_FILE" ]] && { printf "${R}  ✗ ISO not found: %s${N}\n\n" "$ISO_FILE"; exit 1; }
+    printf "\n${C}  Verifying SHA256 (~30s)...${N}\n\n"
+    local computed
+    computed=$(sha256sum "$ISO_FILE" | awk '{print toupper($1)}')
+    printf "  Computed : ${W}%s${N}\n" "$computed"
+    printf "  Expected : ${W}%s${N}\n" "$OFFICIAL_SHA256"
+    if [[ "$computed" == "$OFFICIAL_SHA256" ]]; then
+        printf "\n  ${G}${BOLD}✔ MATCH — ISO is authentic${N}\n\n"
+        write_status "VERIFIED_OK"
+    else
+        printf "\n  ${R}${BOLD}✗ MISMATCH${N}\n\n"
+        write_status "HASH_FAIL"
+    fi
+}
+
+cmd_stop() {
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        tmux kill-session -t "$SESSION_NAME"
+        write_status "INTERRUPTED"
+        printf "${Y}  ⚠ Paused. Run ${W}win11${Y} to resume.${N}\n\n"
+    else
+        printf "${D}  No active session.${N}\n\n"
+    fi
+}
+
+cmd_clean() {
+    printf "${Y}  Remove partial files and reset? [y/N] ${N}"
+    read -r confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        rm -f "$ISO_FILE" "${ISO_FILE}.aria2" "$ARIA2_SESSION" "$LOG_FILE" "$URL_FILE"
+        write_status "IDLE"
+        printf "${G}  ✔ Cleaned. Run ${W}win11${G} to start fresh.${N}\n\n"
+    else
+        printf "${D}  Cancelled.${N}\n\n"
+    fi
+}
+
+cmd_help() {
+    print_banner
+    cat << EOF
+${W}  COMMANDS${N}
+    ${W}win11${N}           Start or resume download
+    ${W}win11 status${N}    Show progress bar
+    ${W}win11 attach${N}    Open live download session
+    ${W}win11 stop${N}      Pause download
+    ${W}win11 verify${N}    Re-check SHA256 of existing ISO
+    ${W}win11 clean${N}     Wipe all files and reset
+    ${W}win11 help${N}      Show this help
+
+${W}  GET YOUR LINK${N}
+    ${D}→${N}  microsoft.com/en-us/software-download/windows11
+    ${D}→${N}  Select ISO → English → 64-bit Download → Copy link
+
+EOF
+}
+
+# ── Internal worker (called from inside tmux) ─────────────────────
+[[ "${1:-}" == "--worker" ]] && { do_download; exit 0; }
+
+# ── Main ──────────────────────────────────────────────────────────
+main() {
+    case "${1:-}" in
+        status)         check_deps; show_progress; exit 0 ;;
+        attach)         cmd_attach; exit 0 ;;
+        verify)         check_deps; cmd_verify; exit 0 ;;
+        stop)           cmd_stop; exit 0 ;;
+        clean)          cmd_clean; exit 0 ;;
+        help|-h|--help) cmd_help; exit 0 ;;
+    esac
+
+    check_deps
+    clear_screen
+    print_banner
+    mkdir -p "$ISO_DIR"
+
+    local status; status=$(read_status)
+
+    # Already done?
+    if [[ "$status" == "VERIFIED_OK" ]]; then
+        show_progress
+        printf "  ISO already complete. Use ${W}win11 clean${N} to re-download.\n\n"
+        exit 0
+    fi
+
+    # Already running?
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        show_progress
+        printf "  ${C}Download already running in background.${N}\n"
+        printf "  ${W}win11 attach${N} to watch  •  ${W}win11 status${N} to check\n\n"
+        exit 0
+    fi
+
+    # Determine URL — reuse saved one or prompt for new
+    local url=""
+    local saved_url
+    saved_url=$(load_url)
+
+    if [[ "$status" == "INTERRUPTED" || "$status" == "DOWNLOADING" ]] && [[ -n "$saved_url" ]]; then
+        printf "  ${Y}Resuming previous download.${N}\n"
+        printf "  ${D}Saved URL found. Use it again? [Y/n] ${N}"
+        read -r reuse
+        if [[ "$reuse" =~ ^[Nn]$ ]]; then
+            url=$(prompt_for_url)
+        else
+            url="$saved_url"
+            printf "\n"
+        fi
+    else
+        url=$(prompt_for_url)
+    fi
+
+    printf "  ${D}Destination :${N} ${W}%s${N}\n" "$ISO_FILE"
+    printf "  ${D}Connections :${N} ${W}16 (aria2c)${N}\n"
+    printf "  ${D}Session     :${N} ${W}tmux '%s'${N}\n\n" "$SESSION_NAME"
+
+    # Launch worker in detached tmux
+    if tmux new-session -d -s "$SESSION_NAME" "bash '$SELF' --worker; exec bash"; then
+        write_status "DOWNLOADING"
+        printf "  ${G}✔ Download started in background!${N}\n\n"
+        printf "  ${W}win11 status${N}   — progress bar\n"
+        printf "  ${W}win11 attach${N}   — live output\n"
+        printf "  ${W}win11 stop${N}     — pause\n\n"
+        sleep 2
+        show_progress
+    else
+        printf "  ${R}✗ tmux failed — running in foreground${N}\n\n"
+        do_download
+    fi
+}
+
+main "$@"
