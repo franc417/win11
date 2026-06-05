@@ -1,59 +1,61 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════
-#  win11 — Windows 11 ISO Downloader
-#  • Paste your own Microsoft direct link (any version/language)
-#  • aria2c 16-connection download — maximum speed
-#  • Background tmux daemon — survives terminal close
-#  • Resume support — continues from where it stopped
-#  • SHA256 verification against Microsoft official hash
+#  win11 — Windows 11 ISO Downloader  v2.0
+#  • Auto-resume on disconnect — NEVER triggers SHA256 mid-download
+#  • Rich status — speed, ETA, connections, elapsed, downloaded/total
+#  • Auto-update from GitHub without interrupting active downloads
+#  • win11 kill — nuke all sessions instantly
 # ══════════════════════════════════════════════════════════════════
 
-set -euo pipefail
+set -uo pipefail
 
 # ── Config ────────────────────────────────────────────────────────
-ISO_DIR="/home/mkz/iso"
-ISO_FILE="${ISO_DIR}/Win11_24H2_English_x64.iso"
-ARIA2_SESSION="${ISO_DIR}/.win11_aria2.session"
-LOG_FILE="${ISO_DIR}/.win11_download.log"
-STATUS_FILE="${ISO_DIR}/.win11_status"
-URL_FILE="${ISO_DIR}/.win11_url"
+WIN11_DIR="${WIN11_DIR:-/home/mkz/iso}"
+ISO_FILE="${WIN11_DIR}/Win11_24H2_English_x64.iso"
+ARIA2_SESSION="${WIN11_DIR}/.win11_aria2.session"
+LOG_FILE="${WIN11_DIR}/.win11_download.log"
+STATUS_FILE="${WIN11_DIR}/.win11_status"
+URL_FILE="${WIN11_DIR}/.win11_url"
+START_FILE="${WIN11_DIR}/.win11_start_time"
 SESSION_NAME="win11-download"
 SELF="$(realpath "$0")"
+VERSION="2.0"
+REMOTE_URL="https://raw.githubusercontent.com/franc417/win11/main/win11"
 
 # Official Microsoft SHA256 — Windows 11 24H2 English x64
 OFFICIAL_SHA256="B56B911BF18A2CEAEB3904D87E7C770BDF92D3099599D61AC2497B91BF190B11"
+# Expected full ISO size in bytes (~5.4 GiB)
+ISO_FULL_SIZE=5802987520
 
-# aria2c options — 16 parallel connections, resume enabled
+# aria2c options
 ARIA2_OPTS=(
     --continue=true
     --max-connection-per-server=16
     --split=16
     --min-split-size=5M
-    --file-allocation=falloc
+    --file-allocation=none
     --save-session="${ARIA2_SESSION}"
-    --save-session-interval=10
+    --save-session-interval=5
     --console-log-level=warn
     --summary-interval=1
     --max-tries=0
-    --retry-wait=5
+    --retry-wait=10
     --connect-timeout=30
-    --timeout=120
+    --timeout=60
     --http-accept-gzip=true
     --auto-file-renaming=false
+    --allow-overwrite=false
     --out="Win11_24H2_English_x64.iso"
-    --dir="${ISO_DIR}"
+    --dir="${WIN11_DIR}"
+    --log="${LOG_FILE}"
+    --log-level=warn
 )
 
 # ── Colors ────────────────────────────────────────────────────────
-R=$'\033[0;31m'
-G=$'\033[0;32m'
-Y=$'\033[0;33m'
-C=$'\033[0;36m'
-W=$'\033[1;37m'
-D=$'\033[2;37m'
-BL=$'\033[1;34m'
-N=$'\033[0m'
-BOLD=$'\033[1m'
+R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[0;33m'
+C=$'\033[0;36m'; W=$'\033[1;37m'; D=$'\033[2;37m'
+BL=$'\033[1;34m'; N=$'\033[0m'; BOLD=$'\033[1m'
+MAG=$'\033[0;35m'
 
 clear_screen() { printf '\033[2J\033[H'; }
 
@@ -75,20 +77,9 @@ EOF
     printf "${N}\n"
 }
 
-check_deps() {
-    local missing=()
-    for cmd in aria2c sha256sum tmux; do
-        command -v "$cmd" &>/dev/null || missing+=("$cmd")
-    done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        printf "\n${R}  ✗ Missing:${N} ${missing[*]}\n"
-        printf "${Y}  Fix:${N} sudo pacman -S aria2 tmux coreutils\n\n"
-        exit 1
-    fi
-}
-
+# ── Helpers ───────────────────────────────────────────────────────
 human_bytes() {
-    local b="$1"
+    local b="${1:-0}"
     if   (( b >= 1073741824 )); then awk "BEGIN{printf \"%.2f GiB\", $b/1073741824}"
     elif (( b >= 1048576    )); then awk "BEGIN{printf \"%.1f MiB\", $b/1048576}"
     elif (( b >= 1024       )); then awk "BEGIN{printf \"%.1f KiB\", $b/1024}"
@@ -96,8 +87,25 @@ human_bytes() {
     fi
 }
 
+human_speed() {
+    local b="${1:-0}"
+    if   (( b >= 1048576 )); then awk "BEGIN{printf \"%.1f MB/s\", $b/1048576}"
+    elif (( b >= 1024    )); then awk "BEGIN{printf \"%.1f KB/s\", $b/1024}"
+    else printf "%d B/s" "$b"
+    fi
+}
+
+human_time() {
+    local s="${1:-0}"
+    local h=$(( s / 3600 )) m=$(( (s % 3600) / 60 )) sec=$(( s % 60 ))
+    if (( h > 0 )); then printf "%dh %dm %ds" "$h" "$m" "$sec"
+    elif (( m > 0 )); then printf "%dm %ds" "$m" "$sec"
+    else printf "%ds" "$sec"
+    fi
+}
+
 draw_bar() {
-    local pct=$1 width=${2:-54}
+    local pct=${1:-0} width=${2:-50}
     local filled=$(( pct * width / 100 ))
     local empty=$(( width - filled ))
     printf "${G}"
@@ -112,43 +120,75 @@ read_status()  { cat "$STATUS_FILE" 2>/dev/null || echo "IDLE"; }
 save_url()     { echo "$1" > "$URL_FILE"; }
 load_url()     { cat "$URL_FILE" 2>/dev/null || echo ""; }
 
-# ── Prompt user for download URL ──────────────────────────────────
+check_deps() {
+    local missing=()
+    for cmd in aria2c sha256sum tmux curl; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf "\n${R}  ✗ Missing:${N} ${missing[*]}\n"
+        printf "${Y}  Fix:${N} apt install aria2 tmux curl coreutils\n\n"
+        exit 1
+    fi
+}
+
+# ── Auto-update ───────────────────────────────────────────────────
+# Fetches latest script from GitHub, replaces itself, re-execs
+# Safe: never runs during an active download worker session
+cmd_update() {
+    local silent="${1:-}"
+    [[ "$silent" != "--silent" ]] && printf "\n${C}  Checking for updates...${N}\n"
+    local tmp
+    tmp=$(mktemp)
+    if curl -fsSL --max-time 10 "$REMOTE_URL" -o "$tmp" 2>/dev/null; then
+        local remote_ver
+        remote_ver=$(grep '^VERSION=' "$tmp" 2>/dev/null | cut -d'"' -f2 || echo "")
+        if [[ -n "$remote_ver" && "$remote_ver" != "$VERSION" ]]; then
+            chmod +x "$tmp"
+            cp "$tmp" "$SELF"
+            rm -f "$tmp"
+            printf "  ${G}✔ Updated to v%s — re-launching${N}\n\n" "$remote_ver"
+            sleep 1
+            exec "$SELF" "$@"
+        elif [[ -z "$remote_ver" ]]; then
+            # Silently replace anyway (corrupted version line)
+            chmod +x "$tmp"
+            cp "$tmp" "$SELF"
+            rm -f "$tmp"
+        else
+            rm -f "$tmp"
+            [[ "$silent" != "--silent" ]] && printf "  ${G}✔ Already up to date (v%s)${N}\n\n" "$VERSION"
+        fi
+    else
+        rm -f "$tmp"
+        [[ "$silent" != "--silent" ]] && printf "  ${Y}  Could not reach GitHub — skipping update${N}\n\n"
+    fi
+}
+
+# ── Get download URL ──────────────────────────────────────────────
 prompt_for_url() {
     clear_screen
     print_banner
-
     printf "${W}  How to get your download link:${N}\n\n"
     printf "  ${D}1.${N} Open: ${C}https://www.microsoft.com/en-us/software-download/windows11${N}\n"
     printf "  ${D}2.${N} Select ${W}Windows 11 (multi-edition ISO for x64)${N} → Confirm\n"
     printf "  ${D}3.${N} Choose language ${W}English${N} → Confirm\n"
     printf "  ${D}4.${N} Right-click ${W}64-bit Download${N} → Copy link address\n"
-    printf "  ${D}5.${N} Paste it below\n\n"
+    printf "  ${D}5.${N} Paste it below  ${D}(link expires in 24h)${N}\n\n"
     printf "${W}  ┌─────────────────────────────────────────────────────────────┐${N}\n"
     printf "  │\n"
     printf "  │  ${Y}Paste URL:${N} "
-
     local url=""
     read -r url
-
     printf "  │\n"
     printf "${W}  └─────────────────────────────────────────────────────────────┘${N}\n\n"
-
-    # Basic validation
-    url="${url// /}"  # strip accidental spaces
+    url="${url// /}"
     if [[ -z "$url" ]]; then
-        printf "  ${R}✗ No URL entered. Exiting.${N}\n\n"
-        exit 1
+        printf "  ${R}✗ No URL entered.${N}\n\n"; exit 1
     fi
     if [[ "$url" != http* ]]; then
-        printf "  ${R}✗ That doesn't look like a valid URL.${N}\n\n"
-        exit 1
+        printf "  ${R}✗ Doesn't look like a valid URL.${N}\n\n"; exit 1
     fi
-    if [[ "$url" != *.iso* ]] && [[ "$url" != *microsoft* ]] && [[ "$url" != *download* ]]; then
-        printf "  ${Y}⚠ URL doesn't look like a Windows ISO link. Continue anyway? [y/N] ${N}"
-        read -r confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || exit 1
-    fi
-
     save_url "$url"
     echo "$url"
 }
@@ -157,58 +197,127 @@ prompt_for_url() {
 do_download() {
     local url
     url=$(load_url)
-
-    if [[ -z "$url" ]]; then
-        printf "${R}  ✗ No URL found. Run win11 again and paste the link.${N}\n"
-        write_status "IDLE"
-        exit 1
-    fi
+    [[ -z "$url" ]] && { printf "${R}  ✗ No URL. Run win11 again.${N}\n"; write_status "IDLE"; exit 1; }
 
     write_status "DOWNLOADING"
-    mkdir -p "$ISO_DIR"
+    date +%s > "$START_FILE"
+    mkdir -p "$WIN11_DIR"
 
-    printf "\n${C}  aria2c starting — 16 connections, resume enabled${N}\n"
-    printf "${D}  Saving to: %s${N}\n\n" "$ISO_FILE"
+    printf "\n${C}  aria2c starting — 16 connections, auto-resume enabled${N}\n"
+    printf "${D}  Log: %s${N}\n\n" "$LOG_FILE"
 
     local -a extra=()
+    # Resume from session file if it exists
     [[ -f "$ARIA2_SESSION" ]] && extra+=(--input-file="$ARIA2_SESSION")
 
-    aria2c "${ARIA2_OPTS[@]}" "${extra[@]}" "$url" || true
+    # aria2c exits non-zero on interrupt — we catch it and mark INTERRUPTED
+    # It will NOT be called HASH_FAIL just from a disconnect
+    aria2c "${ARIA2_OPTS[@]}" "${extra[@]}" "$url"
+    local exit_code=$?
 
-    # Post-download verification
-    if [[ -f "$ISO_FILE" ]]; then
-        local sz
-        sz=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
-        if (( sz > 4000000000 )); then
-            write_status "VERIFYING"
-            printf "\n${Y}  ══ Verifying SHA256 (~30s)... ══${N}\n"
-            local computed
-            computed=$(sha256sum "$ISO_FILE" | awk '{print toupper($1)}')
-            if [[ "$computed" == "$OFFICIAL_SHA256" ]]; then
-                write_status "VERIFIED_OK"
-                printf "${G}  ✔ SHA256 MATCH — ISO is authentic and uncorrupted${N}\n"
-            else
-                write_status "HASH_FAIL"
-                printf "${R}  ✗ SHA256 MISMATCH${N}\n"
-                printf "${R}  Expected : %s${N}\n" "$OFFICIAL_SHA256"
-                printf "${R}  Got      : %s${N}\n" "$computed"
-                printf "${Y}  This may happen if the URL was for a different language/version.${N}\n"
-            fi
+    if [[ ! -f "$ISO_FILE" ]]; then
+        write_status "INTERRUPTED"
+        printf "\n${Y}  ⚠ No ISO file found. Marked as interrupted.${N}\n"
+        return
+    fi
+
+    local sz
+    sz=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+
+    # Only verify SHA256 if the file is complete (within 1MB of expected size)
+    local size_diff=$(( ISO_FULL_SIZE - sz ))
+    [[ $size_diff -lt 0 ]] && size_diff=$(( -size_diff ))
+
+    if (( size_diff < 1048576 )); then
+        # File looks complete — verify
+        write_status "VERIFYING"
+        printf "\n${Y}  ══ Download complete. Verifying SHA256 (~30s)... ══${N}\n"
+        local computed
+        computed=$(sha256sum "$ISO_FILE" | awk '{print toupper($1)}')
+        if [[ "$computed" == "$OFFICIAL_SHA256" ]]; then
+            write_status "VERIFIED_OK"
+            rm -f "$ARIA2_SESSION"  # clean up session file on success
+            printf "${G}  ✔ SHA256 MATCH — ISO is authentic and uncorrupted${N}\n"
+            printf "${G}  ✔ Saved to: %s${N}\n" "$ISO_FILE"
         else
-            write_status "INTERRUPTED"
-            printf "${Y}  Download incomplete — run win11 to resume${N}\n"
+            write_status "HASH_FAIL"
+            printf "${R}  ✗ SHA256 MISMATCH${N}\n"
+            printf "${R}  Expected : %s${N}\n" "$OFFICIAL_SHA256"
+            printf "${R}  Got      : %s${N}\n" "$computed"
+            printf "${Y}  Tip: If you used a non-English ISO link the hash will differ.${N}\n"
+            printf "${Y}  Run: win11 verify  (just checks hash, doesn't re-download)${N}\n"
         fi
+    elif (( exit_code != 0 )); then
+        # aria2c was interrupted (network drop, manual stop, etc.)
+        write_status "INTERRUPTED"
+        printf "\n${Y}  ⚠ Download interrupted at %s / %s${N}\n" \
+            "$(human_bytes "$sz")" "$(human_bytes "$ISO_FULL_SIZE")"
+        printf "${Y}  Session saved. Run ${W}win11${Y} to resume automatically.${N}\n"
     else
         write_status "INTERRUPTED"
+        printf "\n${Y}  ⚠ Download incomplete (%s). Run win11 to resume.${N}\n" \
+            "$(human_bytes "$sz")"
     fi
 }
 
-# ── Progress display ──────────────────────────────────────────────
+# ── Parse aria2c log for live stats ──────────────────────────────
+parse_aria2_stats() {
+    # Returns: downloaded_bytes speed_bytes eta_seconds connections
+    local log="$LOG_FILE"
+    local downloaded=0 speed=0 eta=0 connections=0
+
+    if [[ -f "$log" ]]; then
+        # Get last summary line from aria2c log
+        local last_line
+        last_line=$(grep -a 'DL:' "$log" 2>/dev/null | tail -1 || echo "")
+        if [[ -n "$last_line" ]]; then
+            # Extract speed (DL:XXXKiB or DL:XXXMiB)
+            local spd_str
+            spd_str=$(echo "$last_line" | grep -oP 'DL:\K[0-9]+[KMG]iB' || echo "")
+            if [[ -n "$spd_str" ]]; then
+                local num unit
+                num=$(echo "$spd_str" | grep -oP '[0-9]+')
+                unit=$(echo "$spd_str" | grep -oP '[KMG]iB')
+                case "$unit" in
+                    KiB) speed=$(( num * 1024 )) ;;
+                    MiB) speed=$(( num * 1048576 )) ;;
+                    GiB) speed=$(( num * 1073741824 )) ;;
+                esac
+            fi
+            # Extract connections (CN:XX)
+            connections=$(echo "$last_line" | grep -oP 'CN:\K[0-9]+' || echo "0")
+            # Extract ETA
+            local eta_str
+            eta_str=$(echo "$last_line" | grep -oP 'ETA:\K[0-9hms]+' || echo "")
+            if [[ -n "$eta_str" ]]; then
+                local h=0 m=0 s=0
+                [[ "$eta_str" =~ ([0-9]+)h ]] && h=${BASH_REMATCH[1]}
+                [[ "$eta_str" =~ ([0-9]+)m ]] && m=${BASH_REMATCH[1]}
+                [[ "$eta_str" =~ ([0-9]+)s ]] && s=${BASH_REMATCH[1]}
+                eta=$(( h*3600 + m*60 + s ))
+            fi
+        fi
+    fi
+
+    # Get actual file size
+    if [[ -f "$ISO_FILE" ]]; then
+        downloaded=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+    fi
+
+    echo "$downloaded $speed $eta $connections"
+}
+
+# ── Rich status display ───────────────────────────────────────────
 show_progress() {
     local status
     status=$(read_status)
     local saved_url
     saved_url=$(load_url)
+    local now; now=$(date +%s)
+    local start_time=0
+    [[ -f "$START_FILE" ]] && start_time=$(cat "$START_FILE" 2>/dev/null || echo 0)
+    local elapsed=$(( now - start_time ))
+    [[ $elapsed -lt 0 ]] && elapsed=0
 
     clear_screen
     print_banner
@@ -217,66 +326,108 @@ show_progress() {
 
     case "$status" in
         IDLE)
-            printf "  │  ${D}Status:${N}  ${Y}Idle — run ${W}win11${Y} to start${N}\n"
+            printf "  │\n"
+            printf "  │  ${D}Status :${N}  ${Y}Idle${N}\n"
+            printf "  │  ${D}Action :${N}  run ${W}win11${N} to start\n"
+            printf "  │\n"
             ;;
+
         DOWNLOADING)
-            local partial=0 pct=0
-            local TARGET=5802987520
+            read -r dl speed eta conns <<< "$(parse_aria2_stats)"
+            local pct=0
+            (( ISO_FULL_SIZE > 0 && dl > 0 )) && pct=$(( dl * 100 / ISO_FULL_SIZE ))
+            (( pct > 100 )) && pct=100
 
-            if [[ -f "${ISO_FILE}.aria2" && -f "$ISO_FILE" ]]; then
-                partial=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
-            elif [[ -f "$ISO_FILE" ]]; then
-                partial=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
-            fi
+            local remaining=$(( ISO_FULL_SIZE - dl ))
+            [[ $remaining -lt 0 ]] && remaining=0
 
-            (( TARGET > 0 && partial > 0 )) && pct=$(( partial * 100 / TARGET )) || true
-            (( pct > 100 )) && pct=100 || true
+            # Elapsed time
+            local elapsed_str="--"
+            (( start_time > 0 )) && elapsed_str=$(human_time "$elapsed")
 
-            printf "  │  ${D}Status:${N}   ${C}● Downloading...${N}\n"
-            printf "  │  ${D}Progress:${N} ${W}%3d%%${N}  %s / %s\n" \
-                "$pct" "$(human_bytes "$partial")" "$(human_bytes "$TARGET")"
+            # Avg speed
+            local avg_speed=0
+            (( elapsed > 0 && dl > 0 )) && avg_speed=$(( dl / elapsed ))
+
+            printf "  │\n"
+            printf "  │  ${D}Status     :${N}  ${C}● Downloading${N}\n"
+            printf "  │  ${D}Progress   :${N}  ${W}%3d%%${N}  —  %s  /  %s\n" \
+                "$pct" "$(human_bytes "$dl")" "$(human_bytes "$ISO_FULL_SIZE")"
+            printf "  │  ${D}Remaining  :${N}  %s\n" "$(human_bytes "$remaining")"
             printf "  │\n"
             printf "  │  "
-            draw_bar "$pct" 54
+            draw_bar "$pct" 50
             printf "\n"
             printf "  │\n"
-            printf "  │  ${D}Live view:${N}  ${W}win11 attach${N}\n"
-            printf "  │  ${D}Log file:${N}   ${D}%s${N}\n" "$LOG_FILE"
+            printf "  │  ${D}Speed      :${N}  ${G}%s${N}  ${D}(avg: %s)${N}\n" \
+                "$(human_speed "$speed")" "$(human_speed "$avg_speed")"
+            printf "  │  ${D}ETA        :${N}  %s\n" "$(human_time "$eta")"
+            printf "  │  ${D}Elapsed    :${N}  %s\n" "$elapsed_str"
+            printf "  │  ${D}Connections:${N}  ${W}%s${N} / 16\n" "$conns"
+            printf "  │\n"
+            printf "  │  ${D}Live view  :${N}  ${W}win11 attach${N}\n"
+            printf "  │  ${D}Session    :${N}  tmux '%s'\n" "$SESSION_NAME"
+            printf "  │\n"
             ;;
+
         VERIFYING)
-            printf "  │  ${D}Status:${N}  ${Y}⟳ Running SHA256 check...${N}\n"
+            printf "  │\n"
+            printf "  │  ${D}Status :${N}  ${Y}⟳ Running SHA256 verification...${N}\n"
+            printf "  │  ${D}Note   :${N}  this takes ~30 seconds\n"
+            printf "  │\n"
             ;;
+
         VERIFIED_OK)
             local sz; sz=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
-            printf "  │  ${D}Status:${N}  ${G}${BOLD}✔ Complete & Verified${N}\n"
-            printf "  │  ${D}File:${N}    ${W}%s${N}\n" "$ISO_FILE"
-            printf "  │  ${D}Size:${N}    %s\n" "$(human_bytes "$sz")"
-            printf "  │  ${D}SHA256:${N}  ${G}✔ Matches official Microsoft hash${N}\n"
             printf "  │\n"
-            printf "  │  ${G}  Ready to burn or mount!${N}\n"
+            printf "  │  ${D}Status  :${N}  ${G}${BOLD}✔ Complete & Verified${N}\n"
+            printf "  │  ${D}File    :${N}  ${W}%s${N}\n" "$ISO_FILE"
+            printf "  │  ${D}Size    :${N}  %s\n" "$(human_bytes "$sz")"
+            printf "  │  ${D}SHA256  :${N}  ${G}✔ Matches official Microsoft hash${N}\n"
+            printf "  │\n"
+            printf "  │  ${G}  ISO is safe to burn or mount!${N}\n"
+            printf "  │\n"
             ;;
+
         HASH_FAIL)
-            printf "  │  ${D}Status:${N}  ${R}✗ Hash mismatch${N}\n"
-            printf "  │  ${D}Fix:${N}     run ${W}win11 clean${N} then ${W}win11${N} with a fresh link\n"
+            printf "  │\n"
+            printf "  │  ${D}Status :${N}  ${R}✗ SHA256 mismatch${N}\n"
+            printf "  │  ${D}Fix    :${N}  run ${W}win11 verify${N} to re-check\n"
+            printf "  │           or ${W}win11 clean${N} + fresh link to re-download\n"
+            printf "  │\n"
             ;;
+
         INTERRUPTED)
-            printf "  │  ${D}Status:${N}  ${Y}⚠ Interrupted${N}\n"
+            local sz=0
+            [[ -f "$ISO_FILE" ]] && sz=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+            local pct=0
+            (( ISO_FULL_SIZE > 0 && sz > 0 )) && pct=$(( sz * 100 / ISO_FULL_SIZE ))
+            printf "  │\n"
+            printf "  │  ${D}Status    :${N}  ${Y}⚠ Interrupted (network drop or manual stop)${N}\n"
+            printf "  │  ${D}Saved     :${N}  %s  (%d%%)\n" "$(human_bytes "$sz")" "$pct"
+            printf "  │\n"
+            printf "  │  "
+            draw_bar "$pct" 50
+            printf "\n"
+            printf "  │\n"
             if [[ -n "$saved_url" ]]; then
-                printf "  │  ${D}Resume:${N}  run ${W}win11${N} — saved URL will be reused\n"
+                printf "  │  ${D}Resume    :${N}  run ${W}win11${N} — URL & session auto-reused\n"
             else
-                printf "  │  ${D}Resume:${N}  run ${W}win11${N} and paste a fresh link\n"
+                printf "  │  ${D}Resume    :${N}  run ${W}win11${N} and paste a fresh link\n"
             fi
+            printf "  │\n"
             ;;
     esac
 
     printf "${W}  └─────────────────────────────────────────────────────────────┘${N}\n\n"
+    printf "  ${D}Version: v%s  •  win11 help for all commands${N}\n\n" "$VERSION"
 }
 
 # ── Subcommands ───────────────────────────────────────────────────
 cmd_attach() {
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         printf "${C}  Attaching... (detach: Ctrl+B then D)${N}\n\n"
-        sleep 0.5
+        sleep 0.3
         tmux attach -t "$SESSION_NAME"
     else
         printf "${Y}  No active session. Run ${W}win11${Y} to start.${N}\n\n"
@@ -285,17 +436,27 @@ cmd_attach() {
 
 cmd_verify() {
     [[ ! -f "$ISO_FILE" ]] && { printf "${R}  ✗ ISO not found: %s${N}\n\n" "$ISO_FILE"; exit 1; }
-    printf "\n${C}  Verifying SHA256 (~30s)...${N}\n\n"
+    local sz; sz=$(stat -c%s "$ISO_FILE" 2>/dev/null || echo 0)
+    printf "\n${C}  File  : %s${N}\n" "$ISO_FILE"
+    printf "${C}  Size  : %s${N}\n" "$(human_bytes "$sz")"
+    printf "${C}  Verifying SHA256 (~30s)...${N}\n\n"
     local computed
     computed=$(sha256sum "$ISO_FILE" | awk '{print toupper($1)}')
     printf "  Computed : ${W}%s${N}\n" "$computed"
     printf "  Expected : ${W}%s${N}\n" "$OFFICIAL_SHA256"
     if [[ "$computed" == "$OFFICIAL_SHA256" ]]; then
-        printf "\n  ${G}${BOLD}✔ MATCH — ISO is authentic${N}\n\n"
+        printf "\n  ${G}${BOLD}✔ MATCH — ISO is authentic and safe to use${N}\n\n"
         write_status "VERIFIED_OK"
     else
-        printf "\n  ${R}${BOLD}✗ MISMATCH${N}\n\n"
-        write_status "HASH_FAIL"
+        local size_diff=$(( ISO_FULL_SIZE - sz ))
+        [[ $size_diff -lt 0 ]] && size_diff=$(( -size_diff ))
+        if (( size_diff > 1048576 )); then
+            printf "\n  ${Y}  File is incomplete (%s / %s) — resume download first${N}\n\n" \
+                "$(human_bytes "$sz")" "$(human_bytes "$ISO_FULL_SIZE")"
+        else
+            printf "\n  ${R}${BOLD}✗ MISMATCH — ISO may be corrupted or wrong edition${N}\n\n"
+            write_status "HASH_FAIL"
+        fi
     fi
 }
 
@@ -303,17 +464,45 @@ cmd_stop() {
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         tmux kill-session -t "$SESSION_NAME"
         write_status "INTERRUPTED"
-        printf "${Y}  ⚠ Paused. Run ${W}win11${Y} to resume.${N}\n\n"
+        printf "${Y}  ⚠ Paused. Session file saved.${N}\n"
+        printf "${Y}  Run ${W}win11${Y} to resume automatically.${N}\n\n"
     else
         printf "${D}  No active session.${N}\n\n"
     fi
 }
 
+cmd_kill() {
+    local killed=0
+    # Kill named session
+    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        tmux kill-session -t "$SESSION_NAME"
+        (( killed++ ))
+    fi
+    # Kill any other win11 related sessions
+    while IFS= read -r sess; do
+        [[ "$sess" == *"win11"* ]] && tmux kill-session -t "$sess" 2>/dev/null && (( killed++ ))
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+
+    # Kill any aria2c processes
+    pkill -f "aria2c.*Win11" 2>/dev/null && (( killed++ )) || true
+
+    write_status "INTERRUPTED"
+    if (( killed > 0 )); then
+        printf "${R}  ✗ Killed %d session(s). Download stopped.${N}\n" "$killed"
+        printf "${Y}  Run ${W}win11${Y} to resume.${N}\n\n"
+    else
+        printf "${D}  Nothing to kill.${N}\n\n"
+    fi
+}
+
 cmd_clean() {
-    printf "${Y}  Remove partial files and reset? [y/N] ${N}"
+    printf "${Y}  This will delete the partial ISO and all session files.${N}\n"
+    printf "${Y}  Are you sure? [y/N] ${N}"
     read -r confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        rm -f "$ISO_FILE" "${ISO_FILE}.aria2" "$ARIA2_SESSION" "$LOG_FILE" "$URL_FILE"
+        cmd_kill 2>/dev/null || true
+        rm -f "$ISO_FILE" "${ISO_FILE}.aria2" "$ARIA2_SESSION" \
+              "$LOG_FILE" "$URL_FILE" "$START_FILE"
         write_status "IDLE"
         printf "${G}  ✔ Cleaned. Run ${W}win11${G} to start fresh.${N}\n\n"
     else
@@ -325,17 +514,30 @@ cmd_help() {
     print_banner
     cat << EOF
 ${W}  COMMANDS${N}
-    ${W}win11${N}           Start or resume download
-    ${W}win11 status${N}    Show progress bar
-    ${W}win11 attach${N}    Open live download session
-    ${W}win11 stop${N}      Pause download
-    ${W}win11 verify${N}    Re-check SHA256 of existing ISO
-    ${W}win11 clean${N}     Wipe all files and reset
-    ${W}win11 help${N}      Show this help
+    ${W}win11${N}            Start or resume download (auto-detects saved URL)
+    ${W}win11 status${N}     Rich progress — speed, ETA, size, connections
+    ${W}win11 attach${N}     Open live aria2c session (Ctrl+B D to detach)
+    ${W}win11 stop${N}       Pause gracefully (saves session for resume)
+    ${W}win11 kill${N}       Kill ALL sessions and aria2c processes immediately
+    ${W}win11 verify${N}     Check SHA256 of existing ISO
+    ${W}win11 clean${N}      Wipe all files and start fresh
+    ${W}win11 update${N}     Force update from GitHub
+    ${W}win11 help${N}       Show this help
+
+${W}  RESUME BEHAVIOUR${N}
+    ${D}→${N}  Interruptions (network drop, kill, reboot) are safe
+    ${D}→${N}  Session file is always saved every 5 seconds
+    ${D}→${N}  SHA256 is ONLY checked when download is 100% complete
+    ${D}→${N}  Run ${W}win11${N} after any interruption — resumes automatically
+
+${W}  SAVE LOCATION${N}
+    ${D}→${N}  Default: ${W}~/iso/${N}
+    ${D}→${N}  Override: ${W}WIN11_DIR=/mnt/phone/Download win11${N}
 
 ${W}  GET YOUR LINK${N}
     ${D}→${N}  microsoft.com/en-us/software-download/windows11
     ${D}→${N}  Select ISO → English → 64-bit Download → Copy link
+    ${D}→${N}  Link expires in 24h — get a fresh one if download fails
 
 EOF
 }
@@ -346,25 +548,34 @@ EOF
 # ── Main ──────────────────────────────────────────────────────────
 main() {
     case "${1:-}" in
-        status)         check_deps; show_progress; exit 0 ;;
+        status)         show_progress; exit 0 ;;
         attach)         cmd_attach; exit 0 ;;
         verify)         check_deps; cmd_verify; exit 0 ;;
         stop)           cmd_stop; exit 0 ;;
+        kill)           cmd_kill; exit 0 ;;
         clean)          cmd_clean; exit 0 ;;
+        update)         cmd_update; exit 0 ;;
         help|-h|--help) cmd_help; exit 0 ;;
     esac
 
     check_deps
+
+    # Auto-update silently — skip if download already running
+    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+        cmd_update --silent
+    fi
+
     clear_screen
     print_banner
-    mkdir -p "$ISO_DIR"
+    mkdir -p "$WIN11_DIR"
 
     local status; status=$(read_status)
 
     # Already done?
     if [[ "$status" == "VERIFIED_OK" ]]; then
         show_progress
-        printf "  ISO already complete. Use ${W}win11 clean${N} to re-download.\n\n"
+        printf "  ISO already complete and verified.\n"
+        printf "  Use ${W}win11 clean${N} to re-download.\n\n"
         exit 0
     fi
 
@@ -372,21 +583,23 @@ main() {
     if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
         show_progress
         printf "  ${C}Download already running in background.${N}\n"
-        printf "  ${W}win11 attach${N} to watch  •  ${W}win11 status${N} to check\n\n"
+        printf "  ${W}win11 attach${N} to watch  •  ${W}win11 status${N} to check  •  ${W}win11 kill${N} to stop\n\n"
         exit 0
     fi
 
-    # Determine URL — reuse saved one or prompt for new
+    # Determine URL
     local url=""
     local saved_url
     saved_url=$(load_url)
 
-    if [[ "$status" == "INTERRUPTED" || "$status" == "DOWNLOADING" ]] && [[ -n "$saved_url" ]]; then
-        printf "  ${Y}Resuming previous download.${N}\n"
-        printf "  ${D}Saved URL found. Use it again? [Y/n] ${N}"
-        read -r reuse
-        if [[ "$reuse" =~ ^[Nn]$ ]]; then
+    if [[ -n "$saved_url" && ( "$status" == "INTERRUPTED" || "$status" == "DOWNLOADING" ) ]]; then
+        printf "  ${Y}Resuming previous download automatically.${N}\n"
+        printf "  ${D}Saved URL and session file will be reused.${N}\n"
+        printf "  ${D}Press Enter to continue or type 'new' for a fresh link: ${N}"
+        read -r choice
+        if [[ "$choice" == "new" ]]; then
             url=$(prompt_for_url)
+            rm -f "$ARIA2_SESSION"  # clear old session for fresh URL
         else
             url="$saved_url"
             printf "\n"
@@ -396,16 +609,19 @@ main() {
     fi
 
     printf "  ${D}Destination :${N} ${W}%s${N}\n" "$ISO_FILE"
-    printf "  ${D}Connections :${N} ${W}16 (aria2c)${N}\n"
-    printf "  ${D}Session     :${N} ${W}tmux '%s'${N}\n\n" "$SESSION_NAME"
+    printf "  ${D}Connections :${N} ${W}16 parallel (aria2c)${N}\n"
+    printf "  ${D}Session     :${N} ${W}tmux '%s'${N}\n" "$SESSION_NAME"
+    printf "  ${D}Resume      :${N} ${W}automatic on any interruption${N}\n\n"
 
     # Launch worker in detached tmux
     if tmux new-session -d -s "$SESSION_NAME" "bash '$SELF' --worker; exec bash"; then
         write_status "DOWNLOADING"
+        date +%s > "$START_FILE"
         printf "  ${G}✔ Download started in background!${N}\n\n"
-        printf "  ${W}win11 status${N}   — progress bar\n"
-        printf "  ${W}win11 attach${N}   — live output\n"
-        printf "  ${W}win11 stop${N}     — pause\n\n"
+        printf "  ${W}win11 status${N}   — rich progress bar\n"
+        printf "  ${W}win11 attach${N}   — live aria2c output\n"
+        printf "  ${W}win11 stop${N}     — pause (resumes automatically later)\n"
+        printf "  ${W}win11 kill${N}     — force stop everything\n\n"
         sleep 2
         show_progress
     else
